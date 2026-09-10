@@ -55,7 +55,7 @@ td.win{color:#e8590c;font-weight:700}
 </select>
 <input id="coefCustom" type="number" inputmode="decimal" placeholder="填写系数，如 8000" style="display:none;margin-top:6px">
 <label>货量明细（不同尺寸点「加一行」；也可粘贴客户询价后点「识别填入」）</label>
-<textarea id="paste" class="copybox" style="min-height:52px" placeholder="如：211*32*115cm 1件 114kg（可多行）"></textarea>
+<textarea id="paste" class="copybox" style="min-height:52px" placeholder="如：6*（118*58*74cm，120kg）或 211*32*115cm 1件 114kg（可多行粘贴）"></textarea>
 <button class="add" type="button" onclick="parsePaste()">识别填入</button>
 <div id="items"></div>
 <button class="add" type="button" onclick="addItem()">+ 加一行货物</button>
@@ -224,33 +224,101 @@ function collectItems(){
   }
   return {items:out, bad:bad};
 }
+/* ---------------------------------------------------------------------------
+   客户询价文本解析（纯函数，可被自动化测试直接调用）
+   支持的写法（实测来自真实询价）：
+     1) 件数*（长*宽*高cm，重量kg）   如 6*（118*58*74cm，120kg）
+     2) 件数*长*宽*高cm，重量kg       如 1*56*41*45cm，80kg
+     3) 长*宽*高cm 件数件 重量kg      如 211*32*115cm 1件 114kg
+     4) 件数件 长*宽*高cm 重量kg      如 6件 118*58*74cm 120kg
+     5) 长×宽×高cm，重量kg×件数       如 118*58*74cm，120kg×6
+     6) 长118 宽58 高74 6件 120公斤
+   规则：尺寸/件数/重量缺一不可的行会被跳过，不产生脏数据。
+   --------------------------------------------------------------------------- */
+function normalizeCargoText(text){
+  var s = String(text == null ? '' : text);
+  // 全角数字/符号 -> 半角，统一乘号与分隔符，便于后续正则
+  s = s.replace(/[０-９]/g, function(ch){return String.fromCharCode(ch.charCodeAt(0) - 65248);});
+  s = s.replace(/[（【\[]/g, '(').replace(/[）】\]]/g, ')');
+  s = s.replace(/[，、；;]/g, ',');
+  s = s.replace(/[×✕✖＊]/g, '*');
+  s = s.replace(/[Ｘｘ]/g, 'x');
+  return s;
+}
+function splitCargoSegments(text){
+  return normalizeCargoText(text).split(/[\n;]+/).map(function(s){return s.trim();}).filter(function(s){return s;});
+}
+/** 解析单行，返回 {L,W,H,qty,gw} 或 null（信息不足） */
+function parseCargoSegment(segment){
+  var s = segment;
+  var m, L, W, H, qty = null, consumed = '';
+
+  // ① 件数*（长*宽*高…
+  m = s.match(/(\d+(?:\.\d+)?)\s*\*\s*\(\s*(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)/);
+  if(m){qty = parseFloat(m[1]); L = parseFloat(m[2]); W = parseFloat(m[3]); H = parseFloat(m[4]); consumed = m[0];}
+  // ② 件数*长*宽*高（四数链，首个数字是件数）
+  if(!consumed){
+    m = s.match(/(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)/);
+    if(m){qty = parseFloat(m[1]); L = parseFloat(m[2]); W = parseFloat(m[3]); H = parseFloat(m[4]); consumed = m[0];}
+  }
+  // ③ 长*宽*高（三数链）
+  if(!consumed){
+    m = s.match(/(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)\s*[*x]\s*(\d+(?:\.\d+)?)/);
+    if(m){L = parseFloat(m[1]); W = parseFloat(m[2]); H = parseFloat(m[3]); consumed = m[0];}
+  }
+  // ④ 文字标注：长…宽…高…
+  if(!consumed){
+    m = s.match(/长\s*[:：]?\s*(\d+(?:\.\d+)?)[^\d]{1,4}宽\s*[:：]?\s*(\d+(?:\.\d+)?)[^\d]{1,4}高\s*[:：]?\s*(\d+(?:\.\d+)?)/);
+    if(m){L = parseFloat(m[1]); W = parseFloat(m[2]); H = parseFloat(m[3]); consumed = m[0];}
+  }
+  if(!consumed){return null;}
+
+  var rest = s.replace(consumed, ' ');
+
+  // 件数：优先显式单位（件/箱/个/托/pcs/ctns…），其次末尾的 ×N 写法
+  if(qty === null){
+    var qm = rest.match(/(\d+(?:\.\d+)?)\s*(?:件|箱|个|托|板|pcs\.?|ctns?|cartons?|packages?)/i);
+    if(qm){qty = parseFloat(qm[1]); rest = rest.replace(qm[0], ' ');}
+  }
+  if(qty === null){
+    var tail = rest.match(/[*x]\s*(\d+(?:\.\d+)?)\s*\)?\s*$/);
+    if(tail){qty = parseFloat(tail[1]); rest = rest.replace(tail[0], ' ');}
+  }
+  if(qty === null){qty = 1;}
+
+  // 单件实重：优先带 kg/公斤 单位；否则取行内剩余的最末一个数字
+  var wm = rest.match(/(\d+(?:\.\d+)?)\s*(?:kg|kgs|公斤|千克)/i);
+  var gw = wm ? parseFloat(wm[1]) : null;
+  if(wm){rest = rest.replace(wm[0], ' ');}
+  if(gw === null){
+    var nums = rest.match(/\d+(?:\.\d+)?/g);
+    if(nums && nums.length){gw = parseFloat(nums[nums.length - 1]);}
+  }
+  if(!L || !W || !H || !gw){return null;}
+  return {L:L, W:W, H:H, qty:qty, gw:gw};
+}
+/** 解析整段文本，返回明细行数组（无法识别的行会被跳过） */
+function parseCargoText(text){
+  var segs = splitCargoSegments(text), out = [];
+  for(var i=0;i<segs.length;i++){
+    var row = parseCargoSegment(segs[i]);
+    if(row){out.push(row);}
+  }
+  return out;
+}
 function parsePaste(){
   var raw = document.getElementById('paste').value || '';
-  var segs = raw.split(/[\n;；]+/).map(function(s){return s.trim();}).filter(function(s){return s;});
-  var found = [];
-  for(var i=0;i<segs.length;i++){
-    var s = segs[i];
-    var m = s.match(/(\d+(?:\.\d+)?)\s*[*xX×✕]\s*(\d+(?:\.\d+)?)\s*[*xX×✕]\s*(\d+(?:\.\d+)?)/);
-    if(!m){continue;}
-    var L = parseFloat(m[1]), W = parseFloat(m[2]), H = parseFloat(m[3]);
-    var rest = s.replace(m[0], ' ');
-    var qm = rest.match(/(\d+(?:\.\d+)?)\s*(件|箱|个|pcs\.?|ctns?|cartons?)/i);
-    var qty = qm ? parseFloat(qm[1]) : 1;
-    if(qm){rest = rest.replace(qm[0], ' ');}
-    var wm = rest.match(/(\d+(?:\.\d+)?)\s*(kg|kgs|公斤|千克)/i);
-    var gw = wm ? parseFloat(wm[1]) : null;
-    if(gw === null){var nm = rest.match(/(\d+(?:\.\d+)?)/); if(nm){gw = parseFloat(nm[1]);}}
-    if(gw === null){continue;}
-    found.push({L:L, W:W, H:H, qty:qty, gw:gw});
-  }
+  var total = splitCargoSegments(raw).length;
+  var found = parseCargoText(raw);
   if(!found.length){
-    alert('没识别到「长*宽*高 … 重量」格式\n请按示例填写，例如：\n211*32*115cm 1件 114kg\n（多行可一次粘贴）');
+    alert('没识别到「尺寸 + 重量」信息，请参考以下写法：\n6*（118*58*74cm，120kg）\n或者 211*32*115cm 1件 114kg');
     return;
   }
   clearItems();
   for(var k=0;k<found.length;k++){addItem(found[k]);}
   document.getElementById('paste').value = '';
-  alert('已识别 '+found.length+' 项，请核对尺寸与重量');
+  var skipped = total - found.length;
+  alert('已识别 '+found.length+' 项，请核对尺寸与重量' + (skipped > 0 ? '\n（另有 '+skipped+' 行缺少尺寸或重量，未导入，请手动补充）' : ''));
 }
 function calc(){
   try{
